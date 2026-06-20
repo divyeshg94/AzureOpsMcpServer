@@ -1,99 +1,120 @@
-﻿using System.ComponentModel;
-using AzureOpsMcpServer.Models;
+﻿using Azure.ResourceManager;
+using Azure.ResourceManager.Resources;
+using Azure.ResourceManager.ResourceHealth;
+using System.ComponentModel;
 using ModelContextProtocol.Server;
+using AzureOpsMcpServer.Models;
 
 namespace AzureOpsMcpServer.Tools;
 
 [McpServerToolType]
-public static class AzureOpsTools
+public class AzureOpsTools(ArmClient armClient)
 {
+    private readonly ArmClient _arm = armClient;
+    // ─────────────────────────────────────────────────────────────────
+    // TOOL 1: Deployment Status
+    // ─────────────────────────────────────────────────────────────────
     [McpServerTool(Name = "get_deployment_status")]
-    [Description("Returns recent deployment history for an Azure resource group. " +
-                 "Includes deployment name, status (Succeeded/Failed/Running), " +
-                 "timestamp, and duration in seconds. Use this to understand " +
-                 "what changed recently before an incident.")]
-    public static DeploymentStatusResult GetDeploymentStatus(
-        [Description("The Azure resource group name to query")] string resourceGroup,
-        [Description("Number of recent deployments to return (max 20)")] int count = 5)
+    [Description(
+        "Returns recent deployment history for an Azure resource group. " +
+        "Includes deployment name, provisioning status (Succeeded/Failed/Running), " +
+        "timestamp, duration, and correlation ID for tracing. " +
+        "Use this to understand what changed in an environment before an incident.")]
+    public async Task<DeploymentStatusResult> GetDeploymentStatusAsync(
+        [Description("Azure subscription ID (GUID format)")] string subscriptionId,
+        [Description("Resource group name to query")] string resourceGroup,
+        [Description("Number of recent deployments to return (1–20)")] int count = 5)
     {
-        // In Part 3 we'll wire this to the real Azure Management SDK.
-        // For local testing, we return realistic simulated data.
-        var deployments = Enumerable.Range(1, Math.Min(count, 20))
-            .Select(i => new DeploymentEntry
+        var subscription = _arm.GetSubscriptionResource(
+            SubscriptionResource.CreateResourceIdentifier(subscriptionId));
+        var rg = await subscription.GetResourceGroupAsync(resourceGroup);
+        var deployments = rg.Value.GetArmDeployments();
+        var results = new List<DeploymentEntry>();
+        await foreach (var d in deployments.GetAllAsync())
+        {
+            if (results.Count >= Math.Min(count, 20)) break;
+            results.Add(new DeploymentEntry
             {
-                Name = $"deploy-payments-v1.{10 + i}",
-                Status = i == 1 ? "Failed" : "Succeeded",
-                Timestamp = DateTimeOffset.UtcNow.AddHours(-i * 2),
-                DurationSeconds = Random.Shared.Next(45, 320),
-                DeployedBy = i % 2 == 0 ? "github-actions[bot]" : "divyesh@contoso.com"
-            }).ToList();
-
+                Name            = d.Data.Name,
+                Status          = d.Data.Properties.ProvisioningState?.ToString() ?? "Unknown",
+                Timestamp       = d.Data.Properties.Timestamp ?? DateTimeOffset.MinValue,
+                DurationSeconds = (int)(d.Data.Properties.Duration?.TotalSeconds ?? 0),
+                // SystemData.CreatedBy is populated for deployments triggered via portal/CLI/CI
+                // Falls back to CorrelationId for programmatic deployments
+                TriggeredBy     = d.Data.SystemData?.CreatedBy
+                                  ?? d.Data.Properties.CorrelationId?.ToString()
+                                  ?? "unknown"
+            });
+        }
+        var latest = results.FirstOrDefault();
         return new DeploymentStatusResult
         {
             ResourceGroup = resourceGroup,
-            Deployments = deployments,
-            Summary = $"Last deployment '{deployments[0].Name}' {deployments[0].Status} " +
-                      $"at {deployments[0].Timestamp:u}"
+            Deployments   = results,
+            Summary       = latest is not null
+                ? $"Last deployment '{latest.Name}' {latest.Status} at {latest.Timestamp:u}"
+                : "No deployments found in this resource group"
         };
     }
 
+    // ─────────────────────────────────────────────────────────────────
+    // TOOL 2: Resource Tags
+    // ─────────────────────────────────────────────────────────────────
     [McpServerTool(Name = "get_resource_tags")]
-    [Description("Fetches all tags on an Azure resource and identifies any missing " +
-                 "required tags for FinOps and governance compliance. Required tags: " +
-                 "Environment, Owner, CostCenter, Application.")]
-    public static ResourceTagsResult GetResourceTags(
-        [Description("Full Azure resource ID (e.g. /subscriptions/{sub}/resourceGroups/{rg}/providers/...)")]
-        string resourceId)
+    [Description(
+        "Fetches all tags on an Azure resource group and identifies missing required FinOps tags. " +
+        "Required tags: Environment, Owner, CostCenter, Application. " +
+        "Do NOT use this tool for individual resources - it operates at the resource group level.")]
+    public async Task<ResourceTagsResult> GetResourceTagsAsync(
+        [Description("Azure subscription ID (GUID format)")] string subscriptionId,
+        [Description("Resource group name to check")] string resourceGroup)
     {
-        var requiredTags = new[] { "Environment", "Owner", "CostCenter", "Application" };
-
-        // Simulated: in production this calls Azure Resource Manager via SDK
-        var presentTags = new Dictionary<string, string>
-        {
-            { "Environment", "Production" },
-            { "Application", "payments-service" },
-            { "Owner", "platform-team@contoso.com" }
-            // Note: CostCenter intentionally missing - realistic scenario
-        };
-
-        var missingTags = requiredTags.Except(presentTags.Keys).ToList();
-
+        var subscription = _arm.GetSubscriptionResource(
+            SubscriptionResource.CreateResourceIdentifier(subscriptionId));
+        var rg = await subscription.GetResourceGroupAsync(resourceGroup);
+        var tags = rg.Value.Data.Tags ?? new Dictionary<string, string>();
+        var required = new[] { "Environment", "Owner", "CostCenter", "Application" };
+        var missingTags = required.Except(tags.Keys, StringComparer.OrdinalIgnoreCase).ToList();
         return new ResourceTagsResult
         {
-            ResourceId = resourceId,
-            Tags = presentTags,
+            ResourceId        = rg.Value.Data.Id.ToString(),
+            Tags              = new Dictionary<string, string>(tags),
             MissingRequiredTags = missingTags,
-            Compliant = missingTags.Count == 0,
+            Compliant         = missingTags.Count == 0,
             ComplianceSummary = missingTags.Count == 0
-                ? "Resource is fully tagged"
+                ? "Resource group is fully tagged"
                 : $"Missing {missingTags.Count} required tag(s): {string.Join(", ", missingTags)}"
         };
     }
 
+    // ─────────────────────────────────────────────────────────────────
+    // TOOL 3: Resource Health
+    // ─────────────────────────────────────────────────────────────────
     [McpServerTool(Name = "check_resource_health")]
-    [Description("Returns the current health state of an Azure resource. " +
-                 "Health states: Available, Degraded, Unavailable, Unknown. " +
-                 "Also returns the reason code and recommended action if unhealthy.")]
-    public static ResourceHealthResult CheckResourceHealth(
-        [Description("The resource type (e.g. 'AppService', 'CosmosDB', 'ServiceBus')")]
-        string resourceType,
-        [Description("The resource name as it appears in the Azure portal")]
-        string resourceName)
+    [Description(
+        "Returns the current health state of an Azure resource group from Azure Resource Health. " +
+        "Health states: Available, Degraded, Unavailable, Unknown. " +
+        "Use this to determine whether degradation is platform-initiated or application-caused.")]
+    public async Task<ResourceHealthResult> CheckResourceHealthAsync(
+        [Description("Azure subscription ID (GUID format)")] string subscriptionId,
+        [Description("Resource group name to check")] string resourceGroup)
     {
-        // Simulated health response - Part 3 wires to Azure Resource Health API
-        var isHealthy = !resourceName.Contains("payments", StringComparison.OrdinalIgnoreCase)
-                        || Random.Shared.Next(0, 3) != 0;
-
+        var subscription = _arm.GetSubscriptionResource(
+            SubscriptionResource.CreateResourceIdentifier(subscriptionId));
+        var rg = await subscription.GetResourceGroupAsync(resourceGroup);
+        // GetAvailabilityStatusAsync is an extension method from Azure.ResourceManager.ResourceHealth
+        // It returns the current availability status for any ARM resource scope
+        var statusResponse = await _arm.GetAvailabilityStatusAsync(rg.Value.Id);
+        var data = statusResponse.Value;
         return new ResourceHealthResult
         {
-            ResourceType = resourceType,
-            ResourceName = resourceName,
-            HealthState = isHealthy ? "Available" : "Degraded",
-            ReasonCode = isHealthy ? null : "PlatformInitiated",
-            RecommendedAction = isHealthy ? null :
-                "Check recent deployments and review Application Insights live metrics. " +
-                "If degradation persists > 15 minutes, escalate to platform team.",
-            LastChecked = DateTimeOffset.UtcNow
+            ResourceType      = "ResourceGroup",
+            ResourceName      = resourceGroup,
+            HealthState       = data.Properties?.AvailabilityState?.ToString() ?? "Unknown",
+            ReasonCode        = data.Properties?.ReasonType,
+            RecommendedAction = data.Properties?.RecommendedActions
+                                    ?.FirstOrDefault()?.Action,
+            LastChecked       = DateTimeOffset.UtcNow
         };
     }
 }

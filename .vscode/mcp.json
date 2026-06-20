@@ -1,0 +1,8 @@
+{
+  "servers": {
+    "azureops-mcp": {
+      "type": "http",
+      "url": "https://azureops-mcp-server.bluedesert-ce9e7ec3.eastus.azurecontainerapps.io/mcp"
+    }
+  }
+}

@@ -1,0 +1,15 @@
+bin/
+bin
+obj/
+obj
+.vs/
+.vs
+.vscode/
+*.user
+.git/
+.gitignore
+*.slnx
+Dockerfile
+.dockerignore
+README.md
+Properties/launchSettings.json

@@ -1,34 +1,36 @@
-using ModelContextProtocol.Server;
+using Azure.Identity;
+using Azure.ResourceManager;
 
 var builder = WebApplication.CreateBuilder(args);
 
+// Register ArmClient as singleton - resolves to az login locally,
+// Managed Identity in Azure automatically
+builder.Services.AddSingleton(_ => new ArmClient(new DefaultAzureCredential()));
 builder.Services.AddMcpServer()
-    .WithHttpTransport(options =>
-    {
-        // Stateless mode: recommended unless you need server-to-client
-        // requests like sampling or elicitation. Stateless is safe to 
-        // run behind a load balancer - important when we deploy in Part 3.
-        options.Stateless = true;
-    })
+    .WithHttpTransport(options => { options.Stateless = true; })
     .WithToolsFromAssembly()
     .WithResourcesFromAssembly()
     .WithPromptsFromAssembly();
-
-// CORS is required for Copilot Chat (browser-based) to reach your local server
 builder.Services.AddCors(options =>
 {
     options.AddDefaultPolicy(policy =>
     {
-        policy.AllowAnyOrigin()
-              .AllowAnyHeader()
-              .AllowAnyMethod();
+        policy
+            .WithOrigins(
+                "https://vscode.dev",
+                "https://*.vscode.dev",
+                "vscode-file://vscode-app"
+            )
+            .AllowAnyHeader()
+            .AllowAnyMethod();
     });
 });
 
 var app = builder.Build();
-
 app.UseCors();
-app.MapMcp("/mcp");   // MCP endpoint lives at /mcp
+app.MapMcp("/mcp");
 app.MapGet("/health", () => Results.Ok(new { status = "healthy", server = "AzureOps MCP" }));
 
-app.Run("http://localhost:5100");
+// app.Run() reads ASPNETCORE_HTTP_PORTS from the environment.
+// Local: set to 5100 in launchSettings.json. Container: set to 8080 in Dockerfile.
+app.Run();

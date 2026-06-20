@@ -6,7 +6,7 @@ public record DeploymentEntry
     public required string Status { get; init; }
     public required DateTimeOffset Timestamp { get; init; }
     public required int DurationSeconds { get; init; }
-    public required string DeployedBy { get; init; }
+    public required string TriggeredBy { get; init; }
 }
 
 public record DeploymentStatusResult
